@@ -4,7 +4,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs";
 
 const params = new URLSearchParams(window.location.search);
-const requestedFile = params.get("file") || "pdfs/article.pdf";
+const requestedFile = params.get("file") || "article.pdf";
 
 const viewer = document.getElementById("viewer");
 const pagesRoot = document.getElementById("pages");
