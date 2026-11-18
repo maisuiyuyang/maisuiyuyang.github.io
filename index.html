@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>麦穗与羊 | 死在十七岁的你</title>
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #525659;
+        }
+
+        iframe {
+            display: block;
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+    </style>
+</head>
+
+<body>
+
+    <iframe id="pdf"></iframe>
+
+    <script>
+        const params = new URLSearchParams(window.location.search);
+
+        // Default PDF
+        const pdfFile = params.get("file") || "article.pdf";
+
+        // Load PDF from repository
+        document.getElementById("pdf").src =
+            encodeURI(pdfFile) + "#toolbar=1&navpanes=0&scrollbar=1";
+    </script>
+
+</body>
+</html>
