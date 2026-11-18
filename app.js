@@ -3,211 +3,220 @@ import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs";
 
-const params = new URLSearchParams(window.location.search);
+const params = new URLSearchParams(location.search);
 const requestedFile = params.get("file") || "article.pdf";
 
-const viewer = document.getElementById("viewer");
-const pagesRoot = document.getElementById("pages");
+const stage = document.getElementById("stage");
+const canvas = document.getElementById("pdf-canvas");
+const context = canvas.getContext("2d", { alpha: false });
 const message = document.getElementById("message");
-const pageInput = document.getElementById("page-number");
-const pageCount = document.getElementById("page-count");
+const currentPageLabel = document.getElementById("current-page");
+const totalPagesLabel = document.getElementById("total-pages");
 const zoomLabel = document.getElementById("zoom-level");
-const prevButton = document.getElementById("prev");
-const nextButton = document.getElementById("next");
+const prevButton = document.getElementById("prev-page");
+const nextButton = document.getElementById("next-page");
+const pageIndexButton = document.getElementById("page-index");
+const pageJump = document.getElementById("page-jump");
+const pageInput = document.getElementById("page-input");
 
-let pdf = null;
-let scale = 1;
-let fitWidth = true;
+let pdfDocument = null;
 let currentPage = 1;
-let pageElements = [];
-let renderTasks = new Map();
-let rendering = new Set();
-let intersectionObserver;
+let zoom = 1;                 // Multiplier over fit-to-view width.
+let renderGeneration = 0;
+let activeRenderTask = null;
+let resizeTimer = null;
+let pageAspect = 1;
 
-function setMessage(text, isError = false) {
+function showMessage(text, error = false) {
   message.textContent = text;
-  message.classList.toggle("error", isError);
+  message.classList.toggle("error", error);
   message.hidden = !text;
+  canvas.style.display = text ? "none" : "block";
 }
 
 function updateControls() {
-  pageInput.value = String(currentPage);
-  pageInput.max = String(pdf?.numPages || 1);
-  pageCount.textContent = pdf ? String(pdf.numPages) : "—";
-  prevButton.disabled = !pdf || currentPage <= 1;
-  nextButton.disabled = !pdf || currentPage >= pdf.numPages;
-  zoomLabel.textContent = `${Math.round(scale * 100)}%`;
+  currentPageLabel.textContent = String(currentPage);
+  totalPagesLabel.textContent = pdfDocument ? String(pdfDocument.numPages) : "—";
+  prevButton.disabled = !pdfDocument || currentPage <= 1;
+  nextButton.disabled = !pdfDocument || currentPage >= pdfDocument.numPages;
+  zoomLabel.textContent = zoom === 1 ? "Fit" : `${Math.round(zoom * 100)}%`;
 }
 
-function getScale(page) {
-  const base = page.getViewport({ scale: 1 });
-  if (fitWidth) {
-    const available = Math.max(240, viewer.clientWidth - 24);
-    return Math.min(2.5, available / base.width);
+function calculateScale(page) {
+  const viewport = page.getViewport({ scale: 1 });
+  const availableWidth = Math.max(220, stage.clientWidth - 28);
+  const availableHeight = Math.max(220, stage.clientHeight - 36);
+
+  // Fit the page into the available area initially. Zoom then scales from
+  // the PDF's original vector page, never from a previously rendered bitmap.
+  const fitScale = Math.min(
+    availableWidth / viewport.width,
+    availableHeight / viewport.height,
+    1.5
+  );
+  return fitScale * zoom;
+}
+
+async function renderCurrentPage() {
+  if (!pdfDocument) return;
+
+  const generation = ++renderGeneration;
+
+  if (activeRenderTask) {
+    try { activeRenderTask.cancel(); } catch {}
+    try { await activeRenderTask.promise; } catch {}
+    activeRenderTask = null;
   }
-  return scale;
-}
+  if (generation !== renderGeneration) return;
 
-async function renderPage(pageNumber) {
-  if (!pdf || rendering.has(pageNumber)) return;
-  const canvas = pageElements[pageNumber - 1];
-  if (!canvas || canvas.dataset.rendered === "true") return;
+  showMessage("Rendering page…");
 
-  rendering.add(pageNumber);
   try {
-    const page = await pdf.getPage(pageNumber);
-    const pageScale = getScale(page);
-    const viewport = page.getViewport({ scale: pageScale });
-    const outputScale = Math.min(window.devicePixelRatio || 1, 2);
-    const context = canvas.getContext("2d", { alpha: false });
+    const page = await pdfDocument.getPage(currentPage);
+    if (generation !== renderGeneration) return;
 
-    canvas.width = Math.floor(viewport.width * outputScale);
-    canvas.height = Math.floor(viewport.height * outputScale);
+    const scale = calculateScale(page);
+    const viewport = page.getViewport({ scale });
+
+    // Render at the actual device pixel ratio for crisp text. A pixel budget
+    // protects mobile devices from allocating an excessively large canvas.
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    const pixelBudget = 24_000_000;
+    const requestedPixels = viewport.width * viewport.height * dpr * dpr;
+    const outputScale = requestedPixels > pixelBudget
+      ? Math.sqrt(pixelBudget / (viewport.width * viewport.height))
+      : dpr;
+
+    const pixelWidth = Math.max(1, Math.floor(viewport.width * outputScale));
+    const pixelHeight = Math.max(1, Math.floor(viewport.height * outputScale));
+
+    // Assign fresh backing dimensions on every render. This discards the old
+    // bitmap so zoom can never merely stretch a low-resolution previous page.
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
     canvas.style.width = `${Math.floor(viewport.width)}px`;
     canvas.style.height = `${Math.floor(viewport.height)}px`;
+
+    const transform = outputScale !== 1
+      ? [outputScale, 0, 0, outputScale, 0, 0]
+      : null;
 
     const task = page.render({
       canvasContext: context,
       viewport,
-      transform: outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null
+      transform,
+      background: "#ffffff"
     });
-    renderTasks.set(pageNumber, task);
+    activeRenderTask = task;
     await task.promise;
-    canvas.dataset.rendered = "true";
-  } catch (error) {
-    if (error?.name !== "RenderingCancelledException") {
-      console.error(`Failed to render page ${pageNumber}`, error);
-    }
-  } finally {
-    rendering.delete(pageNumber);
-    renderTasks.delete(pageNumber);
-  }
-}
 
-function observePages() {
-  intersectionObserver?.disconnect();
-  intersectionObserver = new IntersectionObserver(entries => {
-    for (const entry of entries) {
-      if (entry.isIntersecting) {
-        const pageNumber = Number(entry.target.dataset.page);
-        renderPage(pageNumber);
-      }
-    }
-  }, { root: viewer, rootMargin: "900px 0px" });
-
-  pageElements.forEach(canvas => intersectionObserver.observe(canvas));
-}
-
-async function buildPages() {
-  pagesRoot.replaceChildren();
-  pageElements = [];
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const canvas = document.createElement("canvas");
-    canvas.className = "pdf-page";
-    canvas.dataset.page = String(i);
-    canvas.setAttribute("aria-label", `Page ${i}`);
-    pagesRoot.appendChild(canvas);
-    pageElements.push(canvas);
-  }
-  observePages();
-  await renderPage(1);
-  setMessage("");
-}
-
-async function loadPdf() {
-  try {
-    // Keep the requested document inside this GitHub Pages site.
-    const filePath = requestedFile.replace(/^\/+/, "");
-    if (/^[a-z][a-z\d+.-]*:/i.test(filePath) || filePath.split("/").includes("..")) {
-      throw new Error("Invalid PDF path. Use a relative path inside this repository.");
-    }
-
-    const loadingTask = pdfjsLib.getDocument({
-      url: new URL(filePath, document.baseURI).href,
-      withCredentials: false
-    });
-    pdf = await loadingTask.promise;
-    await buildPages();
+    if (generation !== renderGeneration) return;
+    activeRenderTask = null;
+    showMessage("");
     updateControls();
-    updateCurrentPageFromScroll();
   } catch (error) {
-    console.error(error);
-    setMessage(`Unable to open PDF: ${error.message || "Please check the file path."}`, true);
-  }
-}
-
-function updateCurrentPageFromScroll() {
-  if (!pageElements.length) return;
-  const viewerRect = viewer.getBoundingClientRect();
-  let bestPage = currentPage;
-  let bestDistance = Infinity;
-
-  pageElements.forEach((canvas, index) => {
-    const rect = canvas.getBoundingClientRect();
-    const distance = Math.abs((rect.top + rect.bottom) / 2 - (viewerRect.top + viewerRect.bottom) / 2);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      bestPage = index + 1;
+    if (error?.name === "RenderingCancelledException") return;
+    console.error("PDF page rendering failed:", error);
+    if (generation === renderGeneration) {
+      showMessage("This page could not be rendered. Try reloading the document.", true);
     }
-  });
-
-  currentPage = bestPage;
-  updateControls();
-}
-
-function goToPage(pageNumber) {
-  if (!pdf) return;
-  const target = Math.max(1, Math.min(pdf.numPages, Math.floor(pageNumber) || 1));
-  currentPage = target;
-  pageElements[target - 1]?.scrollIntoView({ behavior: "smooth", block: "start" });
-  renderPage(target);
-  updateControls();
-}
-
-async function rerenderAll() {
-  if (!pdf) return;
-  for (const task of renderTasks.values()) {
-    try { task.cancel(); } catch {}
   }
-  pageElements.forEach(canvas => {
-    canvas.dataset.rendered = "false";
-    canvas.width = 0;
-    canvas.height = 0;
-  });
-  await renderPage(currentPage);
+}
+
+async function goToPage(pageNumber) {
+  if (!pdfDocument) return;
+  const target = Math.max(1, Math.min(pdfDocument.numPages, Math.trunc(Number(pageNumber)) || 1));
+  if (target === currentPage) {
+    updateControls();
+    return;
+  }
+  currentPage = target;
   updateControls();
+  await renderCurrentPage();
+}
+
+async function loadDocument() {
+  try {
+    const path = requestedFile.replace(/^\/+/, "");
+    if (
+      /^[a-z][a-z\d+.-]*:/i.test(path) ||
+      path.split("/").includes("..") ||
+      !path.toLowerCase().endsWith(".pdf")
+    ) {
+      throw new Error("Use a relative path to a PDF inside this repository.");
+    }
+
+    const url = new URL(path, document.baseURI).href;
+    const loadingTask = pdfjsLib.getDocument({ url, withCredentials: false });
+    pdfDocument = await loadingTask.promise;
+
+    totalPagesLabel.textContent = String(pdfDocument.numPages);
+    pageInput.max = String(pdfDocument.numPages);
+    await renderCurrentPage();
+  } catch (error) {
+    console.error("PDF loading failed:", error);
+    showMessage(`Unable to open PDF: ${error.message || "Check the file path and try again."}`, true);
+  }
 }
 
 prevButton.addEventListener("click", () => goToPage(currentPage - 1));
 nextButton.addEventListener("click", () => goToPage(currentPage + 1));
-pageInput.addEventListener("change", () => goToPage(Number(pageInput.value)));
+
+pageIndexButton.addEventListener("click", () => {
+  pageJump.hidden = !pageJump.hidden;
+  if (!pageJump.hidden) {
+    pageInput.value = String(currentPage);
+    pageInput.focus();
+    pageInput.select();
+  }
+});
+
+pageJump.addEventListener("submit", event => {
+  event.preventDefault();
+  goToPage(pageInput.value);
+  pageJump.hidden = true;
+});
+
+document.addEventListener("pointerdown", event => {
+  if (!pageJump.hidden &&
+      !pageJump.contains(event.target) &&
+      !pageIndexButton.contains(event.target)) {
+    pageJump.hidden = true;
+  }
+});
 
 document.getElementById("zoom-in").addEventListener("click", () => {
-  fitWidth = false;
-  scale = Math.min(3, scale + 0.15);
-  rerenderAll();
+  zoom = Math.min(4, Math.round((zoom + 0.2) * 100) / 100);
+  renderCurrentPage();
 });
 document.getElementById("zoom-out").addEventListener("click", () => {
-  fitWidth = false;
-  scale = Math.max(0.4, scale - 0.15);
-  rerenderAll();
-});
-document.getElementById("fit-width").addEventListener("click", () => {
-  fitWidth = true;
-  rerenderAll();
+  zoom = Math.max(0.5, Math.round((zoom - 0.2) * 100) / 100);
+  renderCurrentPage();
 });
 
-let scrollTimer;
-viewer.addEventListener("scroll", () => {
-  clearTimeout(scrollTimer);
-  scrollTimer = setTimeout(updateCurrentPageFromScroll, 100);
-});
-
-let resizeTimer;
 window.addEventListener("resize", () => {
-  if (!fitWidth) return;
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(rerenderAll, 180);
+  resizeTimer = setTimeout(() => renderCurrentPage(), 160);
 });
 
-loadPdf();
+document.addEventListener("keydown", event => {
+  if (event.target instanceof HTMLInputElement) return;
+  if (event.key === "ArrowRight" || event.key === "PageDown") {
+    event.preventDefault();
+    goToPage(currentPage + 1);
+  } else if (event.key === "ArrowLeft" || event.key === "PageUp") {
+    event.preventDefault();
+    goToPage(currentPage - 1);
+  } else if (event.key === "+" || event.key === "=") {
+    zoom = Math.min(4, Math.round((zoom + 0.2) * 100) / 100);
+    renderCurrentPage();
+  } else if (event.key === "-") {
+    zoom = Math.max(0.5, Math.round((zoom - 0.2) * 100) / 100);
+    renderCurrentPage();
+  } else if (event.key === "Escape") {
+    pageJump.hidden = true;
+  }
+});
+
+updateControls();
+loadDocument();
